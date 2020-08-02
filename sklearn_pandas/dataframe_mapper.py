@@ -37,10 +37,12 @@ def _build_feature(columns, transformers, options={}):
     return (columns, _build_transformer(transformers), options)
 
 
-def _get_feature_names(estimator):
+def _get_feature_names(estimator, x):
     """
     Attempt to extract feature names based on a given estimator
     """
+    if isinstance(x, pd.DataFrame):
+        return list(x.columns)
     if hasattr(estimator, 'classes_'):
         return estimator.classes_
     elif hasattr(estimator, 'get_feature_names'):
@@ -75,7 +77,8 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
 
         features    a list of tuples with features definitions.
                     The first element is the pandas column selector. This can
-                    be a string (for one column) or a list of strings.
+                    be a string (for one column), a list of strings, or None
+                    (for all columns).
                     The second element is an object that supports
                     sklearn's transform interface, or a list of such objects.
                     The third element is optional and, if present, must be
@@ -162,13 +165,32 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
         self.built_default = state.get('built_default', self.default)
         self.transformed_names_ = state.get('transformed_names_', [])
 
+    def _build_cols(self, X, cols):
+        """
+        Build columns, replacing None sentinel with all cols of X.
+
+        X       a Pandas dataframe; the table to select columns from
+        cols    a string or list of strings representing the columns
+                to select. if None, will be converted to a list of
+                all columns in X.
+
+        Returns a numpy array with the data from the selected columns
+        """
+        if cols is None:
+            if isinstance(X, DataWrapper):
+                cols = list(X.df.columns)
+            else:
+                cols = list(X.columns)
+        return cols
+
     def _get_col_subset(self, X, cols, input_df=False):
         """
         Get a subset of columns from the given table X.
 
         X       a Pandas dataframe; the table to select columns from
         cols    a string or list of strings representing the columns
-                to select
+                to select. if None, will be converted to a list of
+                all columns in X.
 
         Returns a numpy array with the data from the selected columns
         """
@@ -177,6 +199,9 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
             cols = [cols]
         else:
             return_vector = False
+
+        # None is a sentinel to select all columns
+        cols = self._build_cols(X, cols)
 
         # Needed when using the cross-validation compatibility
         # layer for sklearn<0.16.0.
@@ -226,14 +251,18 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
                 _call_fit(self.built_default.fit, Xt, y)
         return self
 
-    def get_names(self, columns, transformer, x, alias=None):
+    def get_names(self, columns, transformer, x, alias=None, mode=None):
         """
         Return verbose names for the transformed columns.
 
         columns       name (or list of names) of the original column(s)
         transformer   transformer - can be a TransformerPipeline
-        x             transformed columns (numpy.ndarray)
+        x             transformed columns (numpy.ndarray or
+                      pd.DataFrame)
         alias         base name to use for the selected columns
+        mode          if not None, either "nonecols" (cols is None
+                      indicating to use all) or "nonecolstransforms"
+                      (cols and transformer is None)
         """
         if alias is not None:
             name = alias
@@ -252,17 +281,40 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
             if isinstance(transformer, TransformerPipeline):
                 inverse_steps = transformer.steps[::-1]
                 estimators = (estimator for name, estimator in inverse_steps)
-                names_steps = (_get_feature_names(e) for e in estimators)
+                names_steps = (_get_feature_names(e, x) for e in estimators)
                 names = next((n for n in names_steps if n is not None), None)
             # Otherwise use the only estimator present
             else:
-                names = _get_feature_names(transformer)
-            if names is not None and len(names) == num_cols:
-                return ['%s_%s' % (name, o) for o in names]
-            # otherwise, return name concatenated with '_1', '_2', etc.
+                names = _get_feature_names(transformer, x)
+
+            if mode == "nonecolstransforms":
+                return columns
+            elif mode == "nonecols":
+                if names is not None and len(names) == num_cols:
+                    return [str(o) for o in names]
+                else:
+                    return [str(o) for o in range(num_cols)]
             else:
-                return [name + '_' + str(o) for o in range(num_cols)]
+                if names is not None and len(names) == num_cols:
+                    return ['%s_%s' % (name, o) for o in names]
+                # otherwise, return name concatenated with '_1', '_2', etc.
+                else:
+                    return [name + '_' + str(o) for o in range(num_cols)]
         else:
+            if isinstance(transformer, TransformerPipeline):
+                inverse_steps = transformer.steps[::-1]
+                estimators = (estimator for name, estimator in inverse_steps)
+                names_steps = (_get_feature_names(e, x) for e in estimators)
+                names = next((n for n in names_steps if n is not None), None)
+            # Otherwise use the only estimator present
+            else:
+                names = _get_feature_names(transformer, x)
+
+            if mode == "nonecols":
+                if names is not None and len(names) == num_cols:
+                    return [str(o) for o in names]
+                else:
+                    return [str(o) for o in range(num_cols)]
             return [name]
 
     def get_dtypes(self, extracted):
@@ -307,8 +359,14 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
             extracted.append(_handle_feature(Xt))
 
             alias = options.get('alias')
+            mode = None
+            if columns is None and transformers is None:
+                mode = "nonecolstransforms"
+            elif columns is None:
+                mode = "nonecols"
             self.transformed_names_ += self.get_names(
-                columns, transformers, Xt, alias)
+                self._build_cols(X, columns), transformers, Xt, alias,
+                mode)
 
         # handle features not explicitly selected
         if self.built_default is not False:
@@ -363,6 +421,13 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
                 index=index)
             # preserve types
             for col, dtype in zip(self.transformed_names_, dtypes):
+                # this ensures that int types with null values are
+                # correctly cast to float
+                if ((np.issubdtype(df_out[col].values.dtype, np.floating) and
+                     np.issubdtype(dtype, np.integer)) and
+                        not np.isfinite(df_out[col].values).all()):
+                    dtype = np.float64
+
                 df_out[col] = df_out[col].astype(dtype)
             return df_out
         else:
